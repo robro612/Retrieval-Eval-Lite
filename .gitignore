@@ -1,2 +1,5 @@
 indexes
 .vscode
+index
+results
+__pycache__
