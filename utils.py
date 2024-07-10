@@ -10,7 +10,7 @@ import polars as pl
 import pyterrier as pt
 import Stemmer
 import torch
-from pyterrier.measures import AP, R, nDCG
+from pyterrier.measures import AP, R, RR, nDCG, Success
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 import numpy as np
@@ -27,6 +27,15 @@ class DataTypes:
     # retrieval results are a pd.DataFrame with [qid, docno, score, rank]
     Result = namedtuple("Result", ["qid", "docno", "score", "rank"])
 
+PT_METRICS = [
+    *[nDCG@k for k in (10, 100, 1000)],
+    *[R@k for k in (1, 10, 100, 1000)]
+    *[RR@k for k in (10, 100, 1000)],
+    *[Success@k for k in (1, 5, 10, 50, 100)],
+]
+
+RETRIEVER_OUTPUT_FILENAME = "retriever_output.tsv"
+RESULTS_FILENAME = "results.tsv"
 
 class Retriever(pt.Transformer, ABC):
 
@@ -146,7 +155,7 @@ class DenseRetriever(Retriever):
             # Encode the texts into embeddings
             embeddings = self.model.encode(
                 texts,
-                normalize_embeddings=(self.metric==faiss.METRIC_INNER_PRODUCT),
+                normalize_embeddings=(self.metric == faiss.METRIC_INNER_PRODUCT),
                 batch_size=batch_size,
             ).astype(np.float32)
 
@@ -227,24 +236,59 @@ def load_dataset(dataset_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Data
     return corpus, queries, qrels
 
 
-if __name__ == "__main__":
+def generate_results(
+    corpus: pd.Dataframe,
+    queries: pd.Dataframe,
+    qrels: pd.Dataframe,
+    save_results_dir: str,
+    results_name: str,
+    retriever: Optional[type | Retriever],
+    load_index: bool = False,
+    index_dir: Optional[str] = None,
+    **retriever_kwargs: Dict[str, Any],
+) -> Tuple[pd.Dataframe, pd.Dataframe]:
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+    if isinstance(retriever, type):
+        retriever = retriever(**retriever_kwargs)
+
+    if load_index:
+        retriever.load_index(index_dir=index_dir)
+    else:
+        retriever.index(corpus, index_dir=index_dir)
+
+    retrieval_output = dr.transform(queries, k=1000)
+
+    eval_metrics = pt.Experiment(
+        [retrieval_output],
+        queries,
+        qrels,
+        eval_metrics=PT_METRICS,
+        names=[results_name],
+    )
+
+    retrieval_output.to_csv(os.path.join(save_results_dir, RETRIEVER_OUTPUT_FILENAME), sep="\t", index=False, header=True)
+    eval_metrics.to_csv(os.path.join(save_results_dir, RESULTS_FILENAME), sep="\t", index=False, header=True)
+
+    return eval_metrics, retrieval_output
+
+if __name__ == "__main__":
 
     dr = DenseRetriever(
         model_name_or_path="jinaai/jina-embeddings-v2-base-en-flash",
         device="cuda",
         max_seq_length=512,
         trust_remote_code=True,
-        model_kwargs = {
-            "torch_dtype" : torch.float16
-        }
+        model_kwargs={"torch_dtype": torch.float16},
     )
 
     corpus, queries, qrels = load_dataset("beir/nq")
 
     print("Indexing")
-    dr.index(corpus, index_dir="index/nq/full_corpus/jina-embeddings-v2-base-en-flash", batch_size=8192)
+    dr.index(
+        corpus,
+        index_dir="index/nq/full_corpus/jina-embeddings-v2-base-en-flash",
+        batch_size=8192,
+    )
 
     print("Loading Index")
     dr.load_index(index_dir="index/nq/full_corpus/jina-embeddings-v2-base-en-flash")
@@ -257,6 +301,6 @@ if __name__ == "__main__":
         [dr],
         queries,
         qrels,
-        eval_metrics=[nDCG@10, R@1000],
+        eval_metrics=[nDCG @ 10, R @ 1000],
         names=["Dense Retriever"],
     )
